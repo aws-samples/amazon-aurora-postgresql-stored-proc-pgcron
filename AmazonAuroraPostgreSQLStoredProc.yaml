@@ -1,0 +1,669 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "Creates necessary resources to demonstrate implementation of business logic using pg_cron, federated queries, and stored procedures"
+Parameters:
+  ErrorEmail:
+    Type: String
+    Description: Email address to receive notification errors
+    MinLength: 5
+    AllowedPattern: "^[\\x20-\\x45]?[\\w-\\+]+(\\.[\\w]+)*@[\\w-]+(\\.[\\w]+)*(\\.[a-z]{2,})$"
+    ConstraintDescription: "Must be a valid email address"
+    Default: 'youremail@example.com'
+  VPCCIDR:
+    Type: String
+    Description: VPC CIDR
+    Default: '10.1.0.0/26'
+  PrivateSubnetOneCIDR:
+    Type: String
+    Description: Subnet One CIDR
+    Default: '10.1.0.0/28'
+  PrivateSubnetTwoCIDR:
+    Type: String
+    Description: Subnet One CIDR
+    Default: '10.1.0.16/28'
+  PublicSubnetOneCIDR:
+    Type: String
+    Description: Public Subnet One CIDR
+    Default: '10.1.0.32/28'
+
+  DBInstanceClass:
+    Description: RDS Instance Class
+    Type: String
+    Default: db.r6g.large
+    AllowedValues:
+      - db.t4g.medium
+      - db.t4g.large
+      - db.r5.large
+      - db.r5.xlarge
+      - db.r5.2xlarge
+      - db.r5.4xlarge
+      - db.r5.8xlarge
+      - db.r5.12xlarge
+      - db.r5.16xlarge
+      - db.r5.24xlarge
+      - db.r6g.large
+      - db.r6g.xlarge
+      - db.r6g.2xlarge
+      - db.r6g.4xlarge
+      - db.r6g.8xlarge
+
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.medium
+    AllowedValues:
+      - t2.medium
+      - t2.large
+      - r5.large
+      - r5.xlarge
+      - r5.2xlarge
+      - r5.4xlarge
+    ConstraintDescription: must be a valid EC2 instance type.
+  AutoHibernateTimeout:
+    Description:  How many minutes idle before shutting down the IDE. Options, 30 minutes, 1 hour, 4 hours, 1day, 1week, Never (0)
+    Type:         Number
+    Default:      60
+    AllowedValues:
+      - 30
+      - 60
+      - 240
+      - 1440
+      - 10080
+      - 0
+Resources:
+  Cloud9IDE:
+    Type: AWS::Cloud9::EnvironmentEC2
+    Properties:
+      AutomaticStopTimeMinutes: !Ref AutoHibernateTimeout
+      Description: "Cloud9 IDE to interact with the Aurora PostgreSQL"
+      InstanceType: !Ref InstanceType
+      ImageId: amazonlinux-2-x86_64
+      Name: PostgreSQLInstance
+      SubnetId: !Ref PublicSubnetOne
+
+  AuroraDBRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: ["sts:AssumeRole"]          
+            Principal:
+              Service: ["rds.amazonaws.com"]
+      Path: /
+      Policies:
+        - PolicyName: lambda-execution-policy
+          PolicyDocument:        
+            Version: '2012-10-17'
+            Statement:
+              Effect: Allow
+              Action: 
+                - 'lambda:InvokeFunction'
+              Resource: 
+                - "Fn::GetAtt": ["ExceptionLambda", "Arn"]
+
+  ExceptionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: ["sts:AssumeRole"]
+            Principal:
+              Service: ["lambda.amazonaws.com"]
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action: 
+                  - "sns:Publish"
+                Resource: !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeInternetGateways
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:ModifyNetworkInterfaceAttribute
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                Resource: '*'
+                
+  VPCFlowLogsRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ""
+            Effect: "Allow"
+            Principal:
+              Service: "vpc-flow-logs.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "vpc-flow-logs-rds"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:DescribeLogGroups"
+                  - "logs:DescribeLogStreams"
+                Resource: !GetAtt VPCFlowLogsGroupRDS.Arn
+
+  FlowLogsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: An symmetric CMK for encrypting flow logs
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: keyForFlowLogs
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow log encryption
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:VPCFlowLogsRDSPostgreSQL
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: !Ref VPCCIDR
+      Tags:
+        - Key: Name
+          Value: 'PostgreSQL-VPC'
+  VPCFlowLogsGroupRDS:
+    Type: "AWS::Logs::LogGroup"
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: "VPCFlowLogsRDSPostgreSQL"
+      KmsKeyId: !GetAtt FlowLogsKey.Arn
+      RetentionInDays: 7
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      LogGroupName: "VPCFlowLogsRDSPostgreSQL"
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogsRole.Arn
+
+  PublicSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref 'VPC'
+      CidrBlock: !Ref PublicSubnetOneCIDR
+      AvailabilityZone: !Select
+        - 1
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      Tags:
+        - Key: Name
+          Value: 'Public Subnet One'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Join:
+              - "-"
+              - - Ref: AWS::StackName
+                - InternetGateway
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref 'VPC'
+      InternetGatewayId: !Ref InternetGateway
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref 'VPC'
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Join:
+              - "-"
+              - - Ref: AWS::StackName
+                - PublicRouteTable
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetOne
+      RouteTableId: !Ref PublicRouteTable
+
+
+  PrivateSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      VpcId: !Ref 'VPC'
+      CidrBlock: !Ref PrivateSubnetOneCIDR
+      Tags:
+        - Key: Name
+          Value: 'Private Subnet One'
+
+  PrivateSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select
+        - 1
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      VpcId: !Ref 'VPC'
+      CidrBlock: !Ref PrivateSubnetTwoCIDR
+      Tags:
+        - Key: Name
+          Value: 'Private Subnet Two'
+
+
+  PrivateRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: 'RDS Route Table'
+
+  PrivateSubnetOneRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PrivateSubnetOne
+      RouteTableId: !Ref PrivateRouteTable
+  PrivateSubnetTwoRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PrivateSubnetTwo
+      RouteTableId: !Ref PrivateRouteTable
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private SG For internal communication
+      VpcId: !Ref 'VPC'
+
+  LambdaSecurityGroupIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow RDS to invoke Lambda
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: 'tcp'
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !GetAtt RDSSecurityGroup.GroupId
+
+  LambdaSecurityGroupEgress1:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allow communication with RDS
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: 'tcp'
+      FromPort: 0
+      ToPort: 0
+      DestinationSecurityGroupId: !GetAtt LambdaSecurityGroup.GroupId
+
+  LambdaSecurityGroupEgress2:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allow communication with SNS
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: 'tcp'
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !GetAtt LambdaSecurityGroup.GroupId
+
+  LambdaSecurityGroupEgress3:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allow communication from SNS to Lambda
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: 'tcp'
+      FromPort: 443
+      ToPort: 443
+      CidrIp: !Ref VPCCIDR        
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private SG For internal communication
+      VpcId: !Ref 'VPC'
+      
+  RDSSecurityGroupIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow reporting db to connect to source db
+      GroupId: !Ref RDSSecurityGroup
+      IpProtocol: 'tcp'
+      FromPort: 5432
+      ToPort: 5432
+      CidrIp: !Ref VPCCIDR  
+
+  RDSSecurityGroupEgress1:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allow communication with Lambda
+      GroupId: !Ref RDSSecurityGroup
+      IpProtocol: 'tcp'
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !GetAtt LambdaSecurityGroup.GroupId
+
+  RDSSecurityGroupEgress2:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allow reporting db to connect to source db
+      GroupId: !Ref RDSSecurityGroup
+      IpProtocol: 'tcp'
+      FromPort: 5432
+      ToPort: 5432
+      CidrIp: !Ref VPCCIDR  
+
+  SNSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private SG For internal communication
+      VpcId: !Ref 'VPC'
+
+  SNSSecurityGroupIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow Lambda to invoke SNS
+      GroupId: !Ref SNSSecurityGroup
+      IpProtocol: 'tcp'
+      FromPort: 443
+      ToPort: 443
+      CidrIp: !Ref VPCCIDR  
+
+  SNSSecurityGroupEgress1:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: Allow Lambda to invoke SNS
+      GroupId: !Ref SNSSecurityGroup
+      IpProtocol: 'tcp'
+      FromPort: 443
+      ToPort: 443
+      CidrIp: !Ref VPCCIDR  
+
+  DBSecretsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: An symmetric CMK for Secrets Manager
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: keyForSecrets
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: kms:*
+            Resource: '*'
+
+  DBSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: /pgsp/dbsecret
+      Description: Generates random value for db password and stores in secrets manager
+      KmsKeyId: !Ref DBSecretsKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "dbadmin", "port": "5432", "host": " "}'
+        GenerateStringKey: "password"
+        PasswordLength: 20
+        ExcludeCharacters: "\"@/\\;.:+'"
+
+  ReportingDBSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: /pgsp/reportingdbsecret
+      Description: Generates random value for db password and stores in secrets manager
+      KmsKeyId: !Ref DBSecretsKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "dbadmin", "port": "5432", "host": " "}'
+        GenerateStringKey: "password"
+        PasswordLength: 20
+        ExcludeCharacters: "\"@/\\;.:+'"
+
+  RDSCluster:
+    Type: "AWS::RDS::DBCluster"
+    Properties:
+      DBClusterIdentifier: pgsp-aurora-cluster-aws-source-db
+      DBClusterParameterGroupName: !Ref RDSDBClusterParameterGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      Engine: aurora-postgresql
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBSecret}::password}}'
+      MasterUsername: dbadmin
+      DatabaseName: "pgsp"
+      Port: 5432
+      StorageEncrypted: true      
+      VpcSecurityGroupIds: [!Ref RDSSecurityGroup]
+      Tags:
+        - Key: Name
+          Value: pgsp-cluster-aws
+  RDSDBClusterParameterGroup:
+    Type: "AWS::RDS::DBClusterParameterGroup"
+    Properties:
+      Description: "Aurora Cluster Parameter Group"
+      Family: aurora-postgresql13
+      Parameters:
+        rds.logical_replication: 1
+        wal_sender_timeout: 0
+  RDSDBInstance1:
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      AvailabilityZone: !GetAtt PrivateSubnetOne.AvailabilityZone
+      DBClusterIdentifier: !Ref RDSCluster
+      DBInstanceClass: !Ref DBInstanceClass
+      DBParameterGroupName: !Ref RDSDBParameterGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      Engine: aurora-postgresql
+      PubliclyAccessible: false        
+  RDSDBParameterGroup:
+    Type: 'AWS::RDS::DBParameterGroup'
+    Properties:
+      Description: Aurora Parameter Group
+      Family: aurora-postgresql13
+
+  RDSClusterReporting:
+    Type: "AWS::RDS::DBCluster"
+    Properties:
+      DBClusterIdentifier: pgsp-aurora-cluster-aws-reporting-db
+      DBClusterParameterGroupName: !Ref RDSDBClusterParameterGroupReporting
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      Engine: aurora-postgresql
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${ReportingDBSecret}::password}}'
+      MasterUsername: dbadmin
+      DatabaseName: "pgsp"
+      Port: 5432
+      StorageEncrypted: true          
+      AssociatedRoles:
+          - FeatureName: Lambda
+            RoleArn: !GetAtt AuroraDBRole.Arn          
+      VpcSecurityGroupIds: [!Ref RDSSecurityGroup]
+      Tags:
+        - Key: Name
+          Value: pgsp-cluster-aws-reporting
+  RDSDBClusterParameterGroupReporting:
+    Type: "AWS::RDS::DBClusterParameterGroup"
+    Properties:
+      Description: "Aurora Cluster Parameter Group"
+      Family: aurora-postgresql13
+      Parameters:
+        rds.logical_replication: 1
+        wal_sender_timeout: 0
+  RDSDBInstanceReporting:
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      AvailabilityZone: !GetAtt PrivateSubnetOne.AvailabilityZone
+      DBClusterIdentifier: !Ref RDSClusterReporting
+      DBInstanceClass: !Ref DBInstanceClass
+      DBParameterGroupName: !Ref RDSDBParameterGroupReporting
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+  RDSDBParameterGroupReporting:
+    Type: 'AWS::RDS::DBParameterGroup'
+    Properties:
+      Description: Aurora Parameter Group
+      Family: aurora-postgresql13
+      Parameters:
+        shared_preload_libraries: pg_stat_statements, pg_cron
+        cron.database_name: "pgsp"
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: String
+      DBSubnetGroupName: source-db-subnet-group-aws
+      SubnetIds: [!Ref PrivateSubnetOne, !Ref PrivateSubnetTwo]
+
+  SMRDSAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DBSecret
+      TargetId: !Ref RDSDBInstance1
+      TargetType: AWS::RDS::DBInstance
+
+  SMReportingRDSAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref ReportingDBSecret
+      TargetId: !Ref RDSDBInstanceReporting
+      TargetType: AWS::RDS::DBInstance
+
+
+  LambdaSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref ErrorEmail
+          Protocol: "email"
+      TopicName: "sp_error"
+      KmsMasterKeyId: "alias/aws/sns"
+
+  ExceptionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.7
+      FunctionName: "ExceptionLambda"
+      Role: !GetAtt ExceptionLambdaRole.Arn
+      Timeout: 300
+      ReservedConcurrentExecutions: 1
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+        SubnetIds: [!Ref PrivateSubnetOne, !Ref PrivateSubnetTwo]
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref LambdaSNSTopic
+          LOG_LEVEL: ERROR
+      Handler: index.ExceptionLambda
+      Code:
+        ZipFile: |
+              import json
+              import os
+              import boto3
+              
+              from botocore.exceptions import ClientError
+              import logging
+            
+              def ExceptionLambda(event, context):
+              
+                TOPIC_ARN = os.environ["TOPIC_ARN"]
+                LOG_LEVEL = os.environ.get('LOG_LEVEL')
+                
+                logger = logging.getLogger()
+                level = logging.getLevelName(LOG_LEVEL)
+                
+                if not isinstance(level, int):
+                  level = logging.INFO
+                  logger.setLevel(level)
+                
+                snsClient = boto3.client("sns")
+                
+                logger.info(f'TOPIC_ARN: {TOPIC_ARN}')
+              
+                try:
+                    res = snsClient.publish(TopicArn=TOPIC_ARN,
+                                                        Message=event["error"],
+                                                        Subject="Stored Procedure Error")
+            
+                except ClientError as e:
+                    print(e)
+                    raise e
+              
+                logger.info(f'----------- Finished SP Error Reporting -----------')
+      Description: Sends the SNS notification to the subscribed email ids
+      TracingConfig:
+        Mode: Active
+
+  LambdaInterfaceEndpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.lambda'
+      PrivateDnsEnabled: true
+      VpcId: !Ref VPC
+      SubnetIds: [!Ref PrivateSubnetOne, !Ref PrivateSubnetTwo]
+      SecurityGroupIds: [!Ref LambdaSecurityGroup, !Ref RDSSecurityGroup]
+
+  SNSInterfaceEndpoint:
+    Type: 'AWS::EC2::VPCEndpoint'
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sns'
+      PrivateDnsEnabled: true
+      VpcId: !Ref VPC
+      SubnetIds: [!Ref PrivateSubnetOne, !Ref PrivateSubnetTwo]
+      SecurityGroupIds: [!Ref SNSSecurityGroup]
+
+Outputs:
+  RDSEndpoint:
+    Description: RDS Endpoint Amazon Aurora PostgreSQL
+    Value: !GetAtt RDSCluster.Endpoint.Address
+  SecretArn:
+    Description: Secret Key ARN
+    Value: !Ref DBSecret
+
