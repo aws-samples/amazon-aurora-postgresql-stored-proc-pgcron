@@ -5,7 +5,7 @@ support of Amazon Aurora PostgreSQL-Compatible Edition’s extensions postgres_f
 and aws_lambda. This is part of a blog and the detailed instructions to execute this code are available in the blog.
 
 ## Solution Architecture
-![Overview](images/solution_architecture.PNG)
+![Overview](images/solution_architecture.png)
 
 ## License
 This library is licensed under the MIT-0 License. See the LICENSE file.
