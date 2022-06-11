@@ -1,4 +1,4 @@
-## Implement business logic in Amazon Aurora PostgreSQL using database stored procedures, federated queries, AWS Lambda and pg_cron
+## Modernize database stored procedures to use Amazon Aurora PostgreSQL federated queries, pg_cron, and AWS Lambda
 
 This repository contains code sample on how to build a framework using SQL and stored procedures, with the
 support of Amazon Aurora PostgreSQL-Compatible Edition’s extensions postgres_fdw, pg_cron,
